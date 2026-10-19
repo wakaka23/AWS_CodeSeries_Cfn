@@ -1,0 +1,17 @@
+version: 0.2
+
+phases:
+  install:
+    commands:
+      - "aws --version"
+
+  pre_build:
+    commands:
+      - echo "[Info] Current Directory"
+      - pwd
+
+  build:
+    commands:
+      # デプロイ処理実行
+      - echo "[Info] Executing change sets..."
+      - ./${CODE_SRC_DIR}/buildscripts/scripts/buildspec-deploy.sh

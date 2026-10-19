@@ -1,0 +1,8 @@
+# Cloudformation Stack Deployment List
+# Format: stack_name, template_file, parameter_file, exec_flg
+# exec_flag: apply or delete
+
+# Resources
+${Stage}-stack1, template1.yaml, parameter1.json, apply
+${Stage}-stack2, template2.yaml, parameter2.json, apply
+${Stage}-stack3, template3.yaml, parameter3.json, apply

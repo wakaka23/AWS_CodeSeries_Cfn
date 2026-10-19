@@ -1,0 +1,699 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::LanguageExtensions
+
+##########################################
+# Parameters
+##########################################
+
+Parameters:
+  ProjectName:
+    Type: String
+  Stage:
+    Type: String
+    AllowedValues:
+      - dev
+      - stg
+      - preprod
+      - prod
+  DevAccountId:
+    Type: String
+  StgAccountId:
+    Type: String
+  PreprodAccountId:
+    Type: String
+  ProdAccountId:
+    Type: String
+  RepositoryName:
+    Type: String
+  BranchName:
+    Type: String
+  CodeSourceDirectory:
+    Type: String
+
+##########################################
+# Conditions
+##########################################
+Conditions:
+  IsCrossAccount: !Not
+    - !Equals
+      - !Ref DevAccountId
+      - !Ref AWS::AccountId
+  IsDevAccount: !Not
+    - Condition: IsCrossAccount
+
+##########################################
+# Resources
+##########################################
+
+Resources:
+
+  # ---------------------------------------------------------------
+  # IAM Resources
+  # ---------------------------------------------------------------
+
+  # IAMポリシー - CodeBuild用
+  IamPolicyForCodeBuild:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${ProjectName}-${Stage}-codebuild-policy
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: '*'
+            Resource: '*'
+      Roles:
+        - !Ref IamRoleForCodeBuild
+
+  # IAMポリシー - CodePipeline用
+  IamPolicyForCodePipeline:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${ProjectName}-${Stage}-codepipeline-policy
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:GetObjectVersion
+              - s3:PutObjectAcl
+              - s3:PutObject
+            Resource: !Sub arn:${AWS::Partition}:s3:::*
+          - Effect: Allow
+            Action:
+              - s3:GetBucketVersioning
+            Resource: !Sub arn:${AWS::Partition}:s3:::*
+          - Effect: Allow
+            Action:
+              - kms:DescribeKey
+              - kms:GenerateDataKey*
+              - kms:Encrypt
+              - kms:ReEncrypt*
+              - kms:Decrypt
+            Resource: !Sub arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:*
+          - Effect: Allow
+            Action:
+              - codecommit:GitPull
+              - codecommit:GitPush
+              - codecommit:GetBranch
+              - codecommit:CreateCommit
+              - codecommit:ListRepositories
+              - codecommit:BatchGetCommits
+              - codecommit:BatchGetRepositories
+              - codecommit:GetCommit
+              - codecommit:GetRepository
+              - codecommit:GetUploadArchiveStatus
+              - codecommit:ListBranches
+              - codecommit:UploadArchive
+            Resource: !Sub arn:${AWS::Partition}:codecommit:${AWS::Region}:${DevAccountId}:${RepositoryName}
+          - Effect: Allow
+            Action:
+              - codebuild:BatchGetBuilds
+              - codebuild:StartBuild
+              - codebuild:BatchGetProjects
+            Resource: !Sub arn:${AWS::Partition}:codebuild:${AWS::Region}:${AWS::AccountId}:project/*
+          - Effect: Allow
+            Action:
+              - codebuild:CreateReportGroup
+              - codebuild:CreateReport
+              - codebuild:UpdateReport
+              - codebuild:BatchPutTestCases
+            Resource: !Sub arn:${AWS::Partition}:codebuild:${AWS::Region}:${AWS::AccountId}:report-group/*
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              - logs:DeleteLogGroup
+              - logs:DescribeLogGroups
+              - logs:PutRetentionPolicy
+              - logs:TagLogGroup
+              - logs:DeleteRetentionPolicy
+            Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:*
+          # CrossAccount時に適用
+          # Dev環境でAssume先IAMRoleを事前定義する必要がある
+          - !If
+            - IsCrossAccount
+            - Effect: Allow
+              Action:
+                - sts:AssumeRole
+              Resource:
+                - !Sub arn:${AWS::Partition}:iam::${DevAccountId}:role/${ProjectName}-dev-crossaccount-assume-role
+            - !Ref AWS::NoValue
+          # CrossAccount時に適用
+          - !If
+            - IsCrossAccount
+            - Effect: Allow
+              Action:
+                - kms:DescribeKey
+                - kms:GenerateDataKey*
+                - kms:Encrypt
+                - kms:ReEncrypt*
+                - kms:Decrypt
+              Resource:
+                - !Sub arn:${AWS::Partition}:kms:${AWS::Region}:${DevAccountId}:key/*
+            - !Ref AWS::NoValue
+      Roles:
+        - !Ref IamRoleForCodePipeline
+
+  # IAMポリシー - EventBridge（ロールバックPR自動作成）用
+  # Dev環境にのみ作成
+  IamPolicyForRollbackEventBridge:
+    Type: AWS::IAM::ManagedPolicy
+    Condition: IsDevAccount
+    Properties:
+      ManagedPolicyName: !Sub ${ProjectName}-${Stage}-rollback-eventbridge-policy
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - codebuild:StartBuild
+            Resource: !GetAtt CodeBuildProjectForRollback.Arn
+      Roles:
+        - !Ref IamRoleForRollbackEventBridge
+
+  # IAMポリシー - stg/preprod/prod環境のCodePipelineからのAssumeRole先
+  # Dev環境にのみ作成
+  IamPolicyForCrossAccountAssume:
+    Type: AWS::IAM::ManagedPolicy
+    Condition: IsDevAccount
+    Properties:
+      ManagedPolicyName: !Sub ${ProjectName}-${Stage}-crossaccount-assume-policy
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - codecommit:GitPull
+              - codecommit:GetRepository
+              - codecommit:GetBranch
+              - codecommit:ListBranches
+              - codecommit:ListRepositories
+              - codecommit:BatchGetRepositories
+              - codecommit:GetCommit
+              - codecommit:BatchGetCommits
+              - codecommit:UploadArchive
+              - codecommit:GetUploadArchiveStatus
+            Resource: !Sub arn:${AWS::Partition}:codecommit:${AWS::Region}:${AWS::AccountId}:${RepositoryName}
+          - Effect: Allow
+            Action:
+              - kms:DescribeKey
+              - kms:GenerateDataKey*
+              - kms:Encrypt
+              - kms:ReEncrypt*
+              - kms:Decrypt
+            Resource:
+              - !Sub arn:${AWS::Partition}:kms:${AWS::Region}:${StgAccountId}:*
+              - !Sub arn:${AWS::Partition}:kms:${AWS::Region}:${PreprodAccountId}:*
+              - !Sub arn:${AWS::Partition}:kms:${AWS::Region}:${ProdAccountId}:*
+          - Effect: Allow
+            Action:
+              - s3:GetObject*
+              - s3:PutObject
+              - s3:PutObjectAcl
+            Resource: !Sub arn:${AWS::Partition}:s3:::*
+      Roles:
+        - !Ref IamRoleForCrossAccountAssume
+
+  # IAMロール - CodeBuild用
+  IamRoleForCodeBuild:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-${Stage}-codebuild-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Stage}-codebuild-role
+
+  # IAMロール - CodePipeline用
+  IamRoleForCodePipeline:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-${Stage}-codepipeline-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Stage}-codepipeline-role
+
+  # IAMロール - EventBridge（ロールバックPR自動作成）用
+  # Dev環境にのみ作成
+  IamRoleForRollbackEventBridge:
+    Type: AWS::IAM::Role
+    Condition: IsDevAccount
+    Properties:
+      RoleName: !Sub ${ProjectName}-${Stage}-rollback-eventbridge-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Action: sts:AssumeRole
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Stage}-rollback-eventbridge-role
+
+  # IAMロール - stg/preprod/prod環境のCodePipelineからのAssumeRole先
+  # Dev環境にのみ作成
+  IamRoleForCrossAccountAssume:
+    Type: AWS::IAM::Role
+    Condition: IsDevAccount
+    Properties:
+      RoleName: !Sub ${ProjectName}-${Stage}-crossaccount-assume-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS:
+                - !Sub arn:aws:iam::${StgAccountId}:root
+                - !Sub arn:aws:iam::${PreprodAccountId}:root
+                - !Sub arn:aws:iam::${ProdAccountId}:root
+            Action: sts:AssumeRole
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Stage}-crossaccount-assume-role
+
+  # ---------------------------------------------------------------
+  # KMS
+  # ---------------------------------------------------------------
+
+  # KMSキー - アーティファクトS3用KMSキー
+  KmsKeyForPipeline:
+    Type: AWS::KMS::Key
+    Properties:
+      BypassPolicyLockoutSafetyCheck: false
+      EnableKeyRotation: true
+      Enabled: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+          - Effect: Allow
+            Principal:
+              AWS:
+                - !GetAtt IamRoleForCodePipeline.Arn
+                - !GetAtt IamRoleForCodeBuild.Arn
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+          - Effect: Allow
+            Principal:
+              AWS:
+                - !GetAtt IamRoleForCodePipeline.Arn
+                - !GetAtt IamRoleForCodeBuild.Arn
+            Action:
+              - kms:CreateGrant
+              - kms:ListGrants
+              - kms:RevokeGrant
+            Resource: '*'
+            Condition:
+              Bool:
+                kms:GrantIsForAWSResource: true
+          # CrossAccount時に適用
+          # Dev環境でAssume先IAMRoleを事前定義する必要がある
+          - !If
+            - IsCrossAccount
+            - Effect: Allow
+              Principal:
+                AWS: !Sub arn:${AWS::Partition}:iam::${DevAccountId}:role/${ProjectName}-dev-crossaccount-assume-role
+              Action:
+                - kms:Encrypt
+                - kms:Decrypt
+                - kms:ReEncrypt*
+                - kms:GenerateDataKey*
+                - kms:DescribeKey
+              Resource: '*'
+            - !Ref AWS::NoValue
+      KeySpec: SYMMETRIC_DEFAULT
+      KeyUsage: ENCRYPT_DECRYPT
+      MultiRegion: false
+      Origin: AWS_KMS
+      PendingWindowInDays: 30
+      RotationPeriodInDays: 365
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Stage}-pipeline-key
+
+  # KMSキーエイリアス - アーティファクトS3用KMSキー
+  KmsAliasForPipeline:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub alias/${ProjectName}-${Stage}-pipeline-key
+      TargetKeyId: !Ref KmsKeyForPipeline
+
+  # ---------------------------------------------------------------
+  # S3
+  # ---------------------------------------------------------------
+
+  # S3バケット - アーティファクト格納用
+  BucketForArtifact:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${ProjectName}-${Stage}-${RepositoryName}-artifact-bucket
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - BucketKeyEnabled: true
+            ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !GetAtt KmsKeyForPipeline.Arn
+      PublicAccessBlockConfiguration:
+        RestrictPublicBuckets: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        BlockPublicAcls: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ArtifactLifeCycle
+            Status: Enabled
+            ExpirationInDays: 90
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 90
+          - Id: CleanUpExpiredDeleteMarkers
+            Status: Enabled
+            ExpiredObjectDeleteMarker: true
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 1
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Stage}-${RepositoryName}-artifact-bucket
+
+  # S3バケットポリシー - アーティファクト格納用
+  BucketPolicyForArtifact:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref BucketForArtifact
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowAccessFromSameAccountRole
+            Effect: Allow
+            Principal:
+              AWS:
+                - !GetAtt IamRoleForCodePipeline.Arn
+                - !GetAtt IamRoleForCodeBuild.Arn
+            Action:
+              - s3:ListBucket
+              - s3:GetObject
+              - s3:PutObject
+              - s3:PutObjectAcl
+            Resource:
+              - !Sub ${BucketForArtifact.Arn}
+              - !Sub ${BucketForArtifact.Arn}/*
+          - Sid: AllowCloudFormationAccess
+            Effect: Allow
+            Principal:
+              Service: cloudformation.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub ${BucketForArtifact.Arn}/*
+          # CrossAccount時に適用
+          # Dev環境でAssume先IAMRoleを事前定義する必要がある
+          - !If
+            - IsCrossAccount
+            - Sid: AllowIamRoleForCrossAccountAssume
+              Effect: Allow
+              Principal:
+                AWS: !Sub arn:${AWS::Partition}:iam::${DevAccountId}:role/${ProjectName}-dev-crossaccount-assume-role
+              Action:
+                - s3:ListBucket
+                - s3:GetObject
+                - s3:PutObject
+                - s3:PutObjectAcl
+              Resource:
+                - !Sub ${BucketForArtifact.Arn}
+                - !Sub ${BucketForArtifact.Arn}/*
+            - !Ref AWS::NoValue
+
+  # ---------------------------------------------------------------
+  # CodeBuild
+  # ---------------------------------------------------------------
+
+  # CodeBuildプロジェクト - ChangeSetステージ用
+  CodeBuildProjectForChangeset:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${ProjectName}-${Stage}-${RepositoryName}-codebuild-for-changeset
+      ServiceRole: !GetAtt IamRoleForCodeBuild.Arn
+      ConcurrentBuildLimit: 1
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux-x86_64-standard:5.0
+        Type: LINUX_CONTAINER
+        HostKernel: LINUX_KERNEL_6
+        PrivilegedMode: false
+        EnvironmentVariables:
+          - Name: ENV_NAME
+            Value: !Ref Stage
+          - Name: ARTIFACT_BUCKET_NAME
+            Value: !Ref BucketForArtifact
+          - Name: CODE_SRC_DIR
+            Value: !Ref CodeSourceDirectory
+          - Name: REGIONAL_DOMAIN_NAME
+            Value: !GetAtt BucketForArtifact.RegionalDomainName
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: !Sub ./${CodeSourceDirectory}/buildscripts/buildspec-changeset.yaml
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Stage}-${RepositoryName}-codebuild-for-changeset
+
+  # CodeBuildプロジェクト - Deployステージ用
+  CodeBuildProjectForDeploy:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${ProjectName}-${Stage}-${RepositoryName}-codebuild-for-deploy
+      ServiceRole: !GetAtt IamRoleForCodeBuild.Arn
+      ConcurrentBuildLimit: 1
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux-x86_64-standard:5.0
+        Type: LINUX_CONTAINER
+        HostKernel: LINUX_KERNEL_6
+        PrivilegedMode: false
+        EnvironmentVariables:
+          - Name: ENV_NAME
+            Value: !Ref Stage
+          - Name: ARTIFACT_BUCKET_NAME
+            Value: !Ref BucketForArtifact
+          - Name: CODE_SRC_DIR
+            Value: !Ref CodeSourceDirectory
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: !Sub ./${CodeSourceDirectory}/buildscripts/buildspec-deploy.yaml
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Stage}-${RepositoryName}-codebuild-for-deploy
+
+  # CodeBuildプロジェクト - ロールバックPR自動作成用
+  # Dev環境にのみ作成
+  CodeBuildProjectForRollback:
+    Type: AWS::CodeBuild::Project
+    Condition: IsDevAccount
+    Properties:
+      Name: !Sub ${ProjectName}-${Stage}-${RepositoryName}-codebuild-for-rollback
+      ServiceRole: !GetAtt IamRoleForCodeBuild.Arn
+      ConcurrentBuildLimit: 1
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux-x86_64-standard:5.0
+        Type: LINUX_CONTAINER
+        HostKernel: LINUX_KERNEL_6
+        PrivilegedMode: false
+        EnvironmentVariables:
+          - Name: REPOSITORY_NAME
+            Value: !Ref RepositoryName
+          - Name: CODE_SRC_DIR
+            Value: !Ref CodeSourceDirectory
+          - Name: TARGET_BRANCH
+            Value: main
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+      Source:
+        Type: CODECOMMIT
+        Location: !Sub https://git-codecommit.${AWS::Region}.amazonaws.com/v1/repos/${RepositoryName}
+        BuildSpec: !Sub ./${CodeSourceDirectory}/buildscripts/buildspec-rollback.yaml
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Stage}-${RepositoryName}-codebuild-for-rollback
+
+  # ---------------------------------------------------------------
+  # CodePipeline
+  # ---------------------------------------------------------------
+
+  # CodePipelineForCfn
+  CodePipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub ${ProjectName}-${Stage}-${RepositoryName}-codepipeline
+      PipelineType: V2
+      RestartExecutionOnUpdate: false
+      RoleArn: !GetAtt IamRoleForCodePipeline.Arn
+      Variables:
+        - Name: ReleaseOrRollback
+          DefaultValue: Release
+      ArtifactStore:
+        Type: S3
+        Location: !Ref BucketForArtifact
+        EncryptionKey:
+          Type: KMS
+          Id: !GetAtt KmsKeyForPipeline.Arn
+      Stages:
+        - Name: Source-Stage
+          Actions:
+            - Name: Checkout
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeCommit
+                Version: "1"
+              # CrossAccount時に適用
+              # Dev環境でAssume先IAMRoleを事前定義する必要がある
+              RoleArn: !If
+                - IsCrossAccount
+                - !Sub arn:${AWS::Partition}:iam::${DevAccountId}:role/${ProjectName}-dev-crossaccount-assume-role
+                - !Ref AWS::NoValue
+              Configuration:
+                RepositoryName: !Ref RepositoryName
+                BranchName: !Ref BranchName
+                PollForSourceChanges: "false"
+              OutputArtifacts:
+                - Name: SourceOutput
+              RunOrder: 1
+        - Name: Changeset-Stage
+          Actions:
+            - Name: ChangeSet
+              Namespace: ChangesetStageVariables
+              ActionTypeId:
+                Category: Test
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: ChangeSetOutput
+              Configuration:
+                ProjectName: !Ref CodeBuildProjectForChangeset
+                EnvironmentVariables: |
+                  [
+                    {"name":"RELEASE_OR_ROLLBACK","value":"#{variables.ReleaseOrRollback}","type":"PLAINTEXT"}
+                  ]
+              RunOrder: 2
+        - Name: Approval-Stage
+          Actions:
+            - Name: Approval
+              ActionTypeId:
+                Category: Approval
+                Owner: AWS
+                Provider: Manual
+                Version: "1"
+              Configuration:
+                CustomData: "承認前にインフラストラクチャの変更内容を必ず確認してください。"
+                ExternalEntityLink: !Sub "https://console.aws.amazon.com/s3/buckets/${BucketForArtifact}?region=${AWS::Region}&prefix=changeset-reports/#{ChangesetStageVariables.COMMIT_HASH}/&showversions=false"
+              RunOrder: 3
+        - Name: Deploy-Stage
+          Actions:
+            - Name: Deploy
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              InputArtifacts:
+                - Name: ChangeSetOutput
+              Configuration:
+                ProjectName: !Ref CodeBuildProjectForDeploy
+                EnvironmentVariables: |
+                  [
+                    {"name":"RELEASE_OR_ROLLBACK","value":"#{variables.ReleaseOrRollback}","type":"PLAINTEXT"},
+                    {"name":"COMMIT_HASH","value":"#{ChangesetStageVariables.COMMIT_HASH}","type":"PLAINTEXT"}
+                  ]
+              RunOrder: 4
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Stage}-${RepositoryName}-codepipeline
+
+  # ---------------------------------------------------------------
+  # EventBridge
+  # ---------------------------------------------------------------
+
+  # EventBridgeルール - ロールバックPR自動作成用
+  # Dev環境にのみ作成
+  EventRuleForRollback:
+    Type: AWS::Events::Rule
+    Condition: IsDevAccount
+    Properties:
+      Name: !Sub ${ProjectName}-${Stage}-${RepositoryName}-rollback-eventbridge
+      EventPattern:
+        source:
+          - aws.codecommit
+        detail-type:
+          - 'CodeCommit Repository State Change'
+        resources:
+          - !Sub arn:${AWS::Partition}:codecommit:${AWS::Region}:${AWS::AccountId}:${RepositoryName}
+        detail:
+          referenceType:
+            - tag
+          referenceName:
+            - wildcard: "v*.*.*"
+          event:
+            - referenceCreated
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt CodeBuildProjectForRollback.Arn
+          RoleArn: !GetAtt IamRoleForRollbackEventBridge.Arn
+          Id: "RollbackCodeBuildTarget"
+          InputTransformer:
+            InputPathsMap:
+              TagName: "$.detail.referenceName"
+            InputTemplate: |
+              {
+                "sourceVersion": <TagName>
+              }
+
+##########################################
+# Outputs
+##########################################

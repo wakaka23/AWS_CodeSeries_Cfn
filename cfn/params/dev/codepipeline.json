@@ -1,0 +1,13 @@
+{
+  "Parameters": {
+    "ProjectName": "wakaka",
+    "Stage": "dev",
+    "DevAccountId": "111111111111",
+    "StgAccountId": "222222222222",
+    "PreprodAccountId": "333333333333",
+    "ProdAccountId": "444444444444",
+    "RepositoryName": "AWS_CodeSeries_Cfn",
+    "CodeSourceDirectory": "cfn",
+    "BranchName": "release"
+  }
+}

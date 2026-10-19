@@ -1,0 +1,17 @@
+version: 0.2
+
+phases:
+  install:
+    commands:
+      - "aws --version"
+
+  pre_build:
+    commands:
+      - echo "[Info] Current Directory"
+      - pwd
+
+  build:
+    commands:
+    # ロールバック処理実行
+      - echo "[Info] Preparing PR for rollback..."
+      - ./${CODE_SRC_DIR}/buildscripts/scripts/buildspec-rollback.sh

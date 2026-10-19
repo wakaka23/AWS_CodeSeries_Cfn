@@ -1,1 +1,1 @@
-段階的なCodeSeries移行実現のためのパイプライン構成
+CodeSeriesを用いたCloudFormationのCICD構成
