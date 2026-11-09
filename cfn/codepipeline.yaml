@@ -60,7 +60,20 @@ Resources:
         Version: "2012-10-17"
         Statement:
           - Effect: Allow
-            Action: '*'
+            Action: [
+              "cloudformation:*",
+              "sns:*",
+              "chatbot:*",
+              "cloudwatch:*",
+              "logs:*",
+              "events:*",
+              "iam:*",
+              "s3:*",
+              "kms:*",
+              "codecommit:*",
+              "codebuild:*",
+              "sts:*"
+            ]
             Resource: '*'
       Roles:
         - !Ref IamRoleForCodeBuild
